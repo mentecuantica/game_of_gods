@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER
 from aiogram.fsm.context import FSMContext
@@ -19,7 +20,10 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 # Инициализация
 router = Router(name="main")
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, arse_mode=ParseMode.HTML,
+    session_timeout=60,  # 60 секунд (по умолчанию 30)
+    read_timeout=30,     # Увеличьте при медленном интернете
+    connect_timeout=30)   # Увеличьте для проблемных сетей
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
