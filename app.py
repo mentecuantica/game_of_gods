@@ -99,8 +99,8 @@ async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
     data = {
         "messages": messages,
         "model": "deepseek-ai/DeepSeek-V3",
-        "max_tokens": 222,
-        "temperature": 0.1,
+        "max_tokens": 1024,
+        "temperature": 0.4,
         "top_p": 0.9
     }
 
