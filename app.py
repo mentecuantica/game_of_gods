@@ -13,11 +13,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.formatting import Bold, Code
 from aiogram.types import BufferedInputFile  # Для работы с файлами
 import os
-import models
+#import models
 from dotenv import load_dotenv
 # Добавим в начало файла
 from typing import Dict, Any
-import database
+#import database
 # Дополнительные импорты
 import csv
 from io import StringIO
