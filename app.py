@@ -1,9 +1,10 @@
 import requests
 import datetime
-import asyncio
 import json
+import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER, CommandObject, StateFilter
@@ -22,22 +23,42 @@ from typing import Dict, Any
 import csv
 from io import StringIO
 
-# Обновим game_context для хранения дополнительных данных
+
+# Настройка расширенного логирования
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация контекстов
 game_context: Dict[int, Dict[str, Any]] = {}
 admin_context = {}
 logs_buffer = []
+
+# Загрузка переменных окружения
+logger.info("Loading environment variables")
 load_dotenv()
 
-# Получаем значения
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-print(ADMIN_ID)
-# Инициализация
-from aiogram.client.default import DefaultBotProperties
 
+if not all([BOT_TOKEN, API_URL, API_KEY, ADMIN_ID]):
+    logger.critical("Missing required environment variables")
+    raise ValueError("Missing required environment variables")
+
+logger.info(f"Admin ID configured as: {ADMIN_ID}")
+
+# Инициализация бота
 router = Router(name="main")
+logger.info("Initializing bot with configurations")
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -50,15 +71,23 @@ dp = Dispatcher(storage=storage)
 game_context = {}
 
 
-
 async def maintain_typing_status(chat_id: int, stop_event: asyncio.Event):
     """Поддерживает статус печатания до установки события остановки"""
-    while not stop_event.is_set():
-        await bot.send_chat_action(chat_id, "typing")
-        await asyncio.sleep(4)  # Обновляем статус каждые 4 секунды
+    logger.debug(f"Starting typing status for chat_id: {chat_id}")
+    try:
+        while not stop_event.is_set():
+            await bot.send_chat_action(chat_id, "typing")
+            logger.debug(f"Sent typing action to chat_id: {chat_id}")
+            await asyncio.sleep(4)
+    except Exception as e:
+        logger.error(f"Error in typing status for chat_id {chat_id}: {e}")
+    finally:
+        logger.debug(f"Stopping typing status for chat_id: {chat_id}")
 
 
 async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
+    logger.info(f"Getting AI response for user_id: {user_id}, question: {question}")
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}"
@@ -75,71 +104,91 @@ async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
         "top_p": 0.9
     }
 
+    logger.debug(f"Request data prepared: {json.dumps(data, indent=2)}")
+
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(maintain_typing_status(chat_id, stop_typing))
+    # Обновляем статистику
+    user_data = game_context.setdefault(user_id, {
+        'message_count': 0,
+        'last_active': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'banned': False
+    })
+
+    if user_data.get('banned'):
+        return "🚫 Ваш доступ к оракулу ограничен"
+
+    user_data['message_count'] += 1
+    user_data['last_active'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        # Увеличиваем таймаут для requests
+        logger.debug("Making API request")
         response = await asyncio.to_thread(
             lambda: requests.post(
                 API_URL,
                 headers=headers,
                 json=data,
-                timeout=60  # Увеличиваем таймаут до 60 секунд
+                timeout=60
             )
         )
         response.raise_for_status()
-        ai_response = response.json()['choices'][0]['message']['content']
+        logger.debug(f"API response status: {response.status_code}")
+
+        response_data = response.json()
+        logger.debug(f"API response data: {json.dumps(response_data, indent=2)}")
+
+        ai_response = response_data['choices'][0]['message']['content']
+        logger.info(f"Successfully got AI response for user {user_id}")
 
         messages.append({"role": "assistant", "content": ai_response})
         game_context[user_id] = messages[-5:]
 
         return ai_response
-    except requests.exceptions.Timeout:
-        logging.error("API request timed out")
-        return "⚠️ Оракул задумался слишком надолго. Пожалуйста, повторите вопрос."
-    except requests.exceptions.RequestException as e:
-        logging.error(f"API Error: {e}")
-        return "⚠️ Оракул временно недоступен. Пожалуйста, попробуйте позже."
+    except Exception as e:
+        logger.error(f"Error getting AI response: {str(e)}", exc_info=True)
+        return "⚠️ Произошла ошибка при получении ответа"
     finally:
         stop_typing.set()
         await typing_task
 
 
-# Добавляем новую команду в обработчик start/help
 @router.message(Command(commands=["start", "help", "menu"]))
 async def cmd_start(message: Message):
     """Обработка команд старта и меню"""
-    menu_text = (
-        "📜 <b>Свиток Команд:</b>\n\n"
-        "/oracle - 🔮 Активировать диалог с Оракулом\n"
-        "/анализ - 📊 Анализ любой темы (напишите после команды)\n"
-"/эмоции - 🌌 Расшифровать эмоциональный код\n"
-"/артефакт - 🏺 Свойства артефакта (название артефакта)\n"
-"/предсказание - 🌠 Получить персональное пророчество от ИИ\n"
-        "✨ <i>Просто напиши вопрос - получь мудрость Вселенной</i>"
-    )
+    logger.info(f"Start command received from user {message.from_user.id}")
+    try:
+        menu_text = (
+            "📜 <b>Свиток Команд:</b>\n\n"
+            "/oracle - 🔮 Активировать диалог с Оракулом\n"
+            "/анализ - 📊 Анализ любой темы (напишите после команды)\n"
+            "/эмоции - 🌌 Расшифровать эмоциональный код\n"
+            "/артефакт - 🏺 Свойства артефакта (название артефакта)\n"
+            "/предсказание - 🌠 Получить персональное пророчество от ИИ\n"
+            "✨ <i>Просто напиши вопрос - получь мудрость Вселенной</i>"
+        )
 
-    # Создаем интерактивные кнопки
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🌀 Анализ", callback_data="cmd_analysis"),
-        InlineKeyboardButton(text="🌌 Эмоции", callback_data="cmd_emotions"),
-        InlineKeyboardButton(text="🌠 Знаки", callback_data="cmd_signs")
-    )
-    builder.row(
-        InlineKeyboardButton(text="💎 Артефакты", callback_data="cmd_artifacts"),
-        InlineKeyboardButton(text="🌪 Пророчества", callback_data="cmd_prophecy"),
-        InlineKeyboardButton(text="🔮 Оракул", callback_data="cmd_oracle")
-    )
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="🌀 Анализ", callback_data="cmd_analysis"),
+            InlineKeyboardButton(text="🌌 Эмоции", callback_data="cmd_emotions"),
+            InlineKeyboardButton(text="🌠 Знаки", callback_data="cmd_signs")
+        )
+        builder.row(
+            InlineKeyboardButton(text="💎 Артефакты", callback_data="cmd_artifacts"),
+            InlineKeyboardButton(text="🌪 Пророчества", callback_data="cmd_prophecy"),
+            InlineKeyboardButton(text="🔮 Оракул", callback_data="cmd_oracle")
+        )
 
-    await message.answer(
-        menu_text,
-        reply_markup=builder.as_markup(),
-        parse_mode=ParseMode.HTML
-    )
-
-
+        await message.answer(
+            menu_text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        logger.info(f"Menu sent successfully to user {message.from_user.id}")
+    except Exception as e:
+        logger.error(f"Error in start command: {e}", exc_info=True)
+        await message.answer("Произошла ошибка при отображении меню")
+#
 # Добавляем обработчики для кнопок
 @router.callback_query(F.data.startswith("cmd_"))
 async def handle_menu_buttons(callback: CallbackQuery):
@@ -168,16 +217,31 @@ async def cmd_oracle(message: Message):
 @router.message(Command("анализ"))
 async def cmd_analysis(message: Message, command: CommandObject):
     """Обработка команды /анализ [тема]"""
+    logger.info(f"Analysis command received from user {message.from_user.id}")
+
     if not command.args:
+        logger.warning(f"No analysis topic provided by user {message.from_user.id}")
         await message.answer("🌀 Укажите тему для анализа после команды, например:\n/анализ судьба мира")
         return
 
-    response = await get_ai_response(
-        message.from_user.id,
-        f"Сделай глубокий анализ по теме: {command.args}. Выяви закономерности, тренды и связи.",
-        message.chat.id
-    )
-    await message.reply(f"🌀 Анализ вселенной по теме '{command.args}':\n\n{response}")
+    try:
+        logger.info(f"Getting analysis for topic: {command.args}")
+        response = await get_ai_response(
+            message.from_user.id,
+            f"Сделай глубокий анализ по теме: {command.args}. Выяви закономерности, тренды и связи.",
+            message.chat.id
+        )
+
+        if response:
+            logger.info(f"Analysis response received for user {message.from_user.id}")
+            await message.reply(f"🌀 Анализ вселенной по теме '{command.args}':\n\n{response}")
+        else:
+            logger.error(f"Empty analysis response for user {message.from_user.id}")
+            await message.reply("⚠️ Не удалось получить анализ. Пожалуйста, попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Error in analysis command: {e}", exc_info=True)
+        await message.reply("Произошла ошибка при выполнении анализа")
+
 
 @router.message(Command("эмоции"))
 async def cmd_emotions(message: Message):
@@ -357,23 +421,6 @@ async def process_user_search(message: Message):
     await message.answer(response)
 
 
-# Обновим функцию get_ai_response для сбора статистики
-async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
-    # Обновляем статистику
-    user_data = game_context.setdefault(user_id, {
-        'message_count': 0,
-        'last_active': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'banned': False
-    })
-
-    if user_data.get('banned'):
-        return "🚫 Ваш доступ к оракулу ограничен"
-
-    user_data['message_count'] += 1
-    user_data['last_active'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Остальная часть функции без изменений
-
 
 
 @router.message(Command("ban"))
@@ -411,11 +458,26 @@ async def unban_user(message: Message, command: CommandObject):
 # Обновим обработчик сообщений для проверки блокировки
 @router.message(F.text & ~F.text.startswith('/'))
 async def handle_general_message(message: Message):
+    # Проверка блокировки
     user_data = game_context.get(message.from_user.id, {})
-
     if user_data.get('banned'):
         await message.answer("🚫 Ваш доступ к оракулу ограничен")
         return
+
+    try:
+        # Получаем ответ от ИИ
+        response = await get_ai_response(
+            user_id=message.from_user.id,
+            question=message.text,
+            chat_id=message.chat.id
+        )
+
+        # Отправляем ответ пользователю
+        await message.reply(f"🔮 Ответ Оракула:\n\n{response}")
+
+    except Exception as e:
+        logger.error(f"Error handling message: {e}", exc_info=True)
+        await message.answer("⚠️ Произошла ошибка при обработке запроса")
 
 @router.callback_query(F.data == "refresh_stats")
 async def refresh_stats(callback: CallbackQuery):
