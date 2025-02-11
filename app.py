@@ -1,8 +1,14 @@
+import contextlib
 import requests
 import datetime
 import json
 import asyncio
 import logging
+from aiogram import Dispatcher
+from aiohttp import ClientTimeout
+
+dp = Dispatcher()
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -11,18 +17,14 @@ from aiogram.filters import Command, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.utils.formatting import Bold, Code
-from aiogram.types import BufferedInputFile  # Для работы с файлами
+from aiogram.types import BufferedInputFile
 import os
-#import models
+import backoff
+import aiohttp
 from dotenv import load_dotenv
-# Добавим в начало файла
-from typing import Dict, Any
-#import database
-# Дополнительные импорты
+from typing import Dict, Any, TypedDict, List, Optional
 import csv
 from io import StringIO
-
 
 # Настройка расширенного логирования
 logging.basicConfig(
@@ -35,15 +37,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# Типизованные данные
+class UserContext(TypedDict):
+    messages: List[Dict[str, str]]
+    message_count: int
+    last_active: str
+    banned: bool
+
+
 # Инициализация контекстов
-game_context: Dict[int, Dict[str, Any]] = {}
+game_context: Dict[int, UserContext] = {}
 admin_context = {}
 logs_buffer = []
 
 # Загрузка переменных окружения
 logger.info("Loading environment variables")
 load_dotenv()
-
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL")
@@ -59,43 +69,85 @@ logger.info(f"Admin ID configured as: {ADMIN_ID}")
 # Инициализация бота
 router = Router(name="main")
 logger.info("Initializing bot with configurations")
+# Инициализация бота с увеличенными таймаутами
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    session_timeout=60,
-    read_timeout=30,
-    connect_timeout=30
+    session_timeout=300,  # 5 минут
+    read_timeout=300,  # 5 минут
+    connect_timeout=60  # 1 минута для установки соединения
 )
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-game_context = {}
 
+
+class APIClient:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        # Увеличенные таймауты для API клиента
+        self.timeout = ClientTimeout(
+            total=300,  # Общий таймаут 5 минут
+            connect=60,  # 1 минута на подключение
+            sock_read=600,  # 4 минуты на чтение
+            sock_connect=30  # 30 секунд на установку сокета
+        )
+
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, asyncio.TimeoutError),
+        max_tries=3,
+        max_time=300,  # Увеличенное время для повторных попыток
+        giveup=lambda e: isinstance(e, aiohttp.ClientResponseError) and e.status == 429
+    )
+    async def ensure_session(self):
+        if self.session is None:
+            import aiohttp
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def make_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        session = await self.ensure_session()
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            async with session.post(API_URL, json=data, headers=headers, timeout=self.timeout) as response:
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 401:
+                logger.error("Unauthorized: Check your API_KEY")
+            raise
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    def __del__(self):
+        if self.session and not self.session.closed:
+            asyncio.create_task(self.session.close())
 
 async def maintain_typing_status(chat_id: int, stop_event: asyncio.Event):
-    """Поддерживает статус печатания до установки события остановки"""
+    """Поддерживает статус печатания с увеличенным интервалом"""
     logger.debug(f"Starting typing status for chat_id: {chat_id}")
     try:
         while not stop_event.is_set():
             await bot.send_chat_action(chat_id, "typing")
-            logger.debug(f"Sent typing action to chat_id: {chat_id}")
-            await asyncio.sleep(4)
+            await asyncio.sleep(4.9)  # Увеличенный интервал, чуть меньше 5 секунд
     except Exception as e:
-        logger.error(f"Error in typing status for chat_id {chat_id}: {e}")
+        logger.error(f"Error in typing status: {e}")
     finally:
         logger.debug(f"Stopping typing status for chat_id: {chat_id}")
 
 
 async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
-    logger.info(f"Getting AI response for user_id: {user_id}, question: {question}")
+    api_client = APIClient()
+    user_data = game_context.setdefault(user_id, init_user_context())
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
-    }
+    if user_data["banned"]:
+        return "🚫 Ваш доступ к оракулу ограничен"
 
-    messages = game_context.get(user_id, [])
-    messages.append({"role": "user", "content": question})
-
+    messages = user_data["messages"][-4:] + [{"role": "user", "content": safe_slice(question, 2000)}]
     data = {
         "messages": messages,
         "model": "deepseek-ai/DeepSeek-V3",
@@ -104,90 +156,121 @@ async def get_ai_response(user_id: int, question: str, chat_id: int) -> str:
         "top_p": 0.9
     }
 
-    logger.debug(f"Request data prepared: {json.dumps(data, indent=2)}")
-
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(maintain_typing_status(chat_id, stop_typing))
-    # Обновляем статистику
-    user_data = game_context.setdefault(user_id, {
-        'message_count': 0,
-        'last_active': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'banned': False
-    })
-
-    if user_data.get('banned'):
-        return "🚫 Ваш доступ к оракулу ограничен"
-
-    user_data['message_count'] += 1
-    user_data['last_active'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        logger.debug("Making API request")
-        response = await asyncio.to_thread(
-            lambda: requests.post(
-                API_URL,
-                headers=headers,
-                json=data,
-                timeout=60
-            )
-        )
-        response.raise_for_status()
-        logger.debug(f"API response status: {response.status_code}")
+        for attempt in range(3):
+            try:
+                response_data = await api_client.make_request(data)
+                if not isinstance(response_data.get("choices"), list) or not response_data["choices"]:
+                    raise ValueError("Invalid API response structure")
 
-        response_data = response.json()
-        logger.debug(f"API response data: {json.dumps(response_data, indent=2)}")
+                content = response_data["choices"][0].get("message", {}).get("content", "")
+                sanitized_response = safe_slice(content.replace('\0', ''), 4000)
 
-        ai_response = response_data['choices'][0]['message']['content']
-        logger.info(f"Successfully got AI response for user {user_id}")
+                user_data.update({
+                    "messages": messages + [{"role": "assistant", "content": sanitized_response}],
+                    "message_count": user_data["message_count"] + 1,
+                    "last_active": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                game_context[user_id] = user_data
 
-        messages.append({"role": "assistant", "content": ai_response})
-        game_context[user_id] = messages[-5:]
+                return sanitized_response
 
-        return ai_response
-    except Exception as e:
-        logger.error(f"Error getting AI response: {str(e)}", exc_info=True)
-        return "⚠️ Произошла ошибка при получении ответа"
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    wait_time = min(2 ** attempt * 30, 240)  # Увеличенное время ожидания между попытками
+                    logger.warning(f"Rate limit exceeded, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                return f"⚠️ Ошибка сервера ({e.status}). Пожалуйста, попробуйте позже."
+
+            except asyncio.TimeoutError:
+                if attempt < 2:
+                    wait_time = min(2 ** attempt * 30, 240)
+                    logger.warning(f"Request timeout, attempt {attempt + 1}/3, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                return "⌛ Время ожидания истекло. Пожалуйста, попробуйте позже."
+
     finally:
         stop_typing.set()
-        await typing_task
+        try:
+            await asyncio.wait_for(typing_task, timeout=10)  # Увеличенный таймаут для остановки typing
+        except asyncio.TimeoutError:
+            typing_task.cancel()
+
+
+# Add to main() function:
+async def cleanup():
+    """Cleanup function to close the API client session"""
+    await api_client.close()
+
+
+async def main():
+    try:
+        dp.include_router(router)
+        await dp.start_polling(bot)
+    finally:
+        await cleanup()
+
+
+# Вспомогательные функции
+def safe_slice(data: Any, max_len: int, default: str = "") -> str:
+    """Безопасный срез для любых типов данных"""
+    try:
+        return str(data)[:max_len]
+    except Exception:
+        return default[:max_len]
+
+
+def init_user_context() -> UserContext:
+    """Инициализация контекста пользователя"""
+    return {
+        "messages": [],
+        "message_count": 0,
+        "last_active": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "banned": False
+    }
+
+
+async def maintain_typing_status(chat_id: int, stop_event: asyncio.Event):
+    """Поддерживает статус печатания"""
+    logger.debug(f"Starting typing status for chat_id: {chat_id}")
+    try:
+        while not stop_event.is_set():
+            await bot.send_chat_action(chat_id, "typing")
+            await asyncio.sleep(4)
+    except Exception as e:
+        logger.error(f"Error in typing status: {e}")
+    finally:
+        logger.debug(f"Stopping typing status for chat_id: {chat_id}")
 
 
 @router.message(Command(commands=["start", "help", "menu"]))
 async def cmd_start(message: Message):
-    """Обработка команд старта и меню"""
-    logger.info(f"Start command received from user {message.from_user.id}")
-    try:
-        menu_text = (
-            "📜 <b>Свиток Команд:</b>\n\n"
-            "/oracle - 🔮 Активировать диалог с Оракулом\n"
-            "/анализ - 📊 Анализ любой темы (напишите после команды)\n"
-            "/эмоции - 🌌 Расшифровать эмоциональный код\n"
-            "/артефакт - 🏺 Свойства артефакта (название артефакта)\n"
-            "/предсказание - 🌠 Получить персональное пророчество от ИИ\n"
-            "✨ <i>Просто напиши вопрос - получь мудрость Вселенной</i>"
-        )
+    """Обработка команд старта"""
+    menu_text = (
+        "📜 <b>Свиток Команд:</b>\n\n"
+        "/oracle - 🔮 Активировать диалог с Оракулом\n"
+        "/анализ - 📊 Анализ любой темы\n"
+        "/эмоции - 🌌 Расшифровать эмоциональный код\n"
+        "/артефакт - 🏺 Свойства артефакта\n"
+        "/предсказание - 🌠 Персональное пророчество"
+    )
 
-        builder = InlineKeyboardBuilder()
-        builder.row(
-            InlineKeyboardButton(text="🌀 Анализ", callback_data="cmd_analysis"),
-            InlineKeyboardButton(text="🌌 Эмоции", callback_data="cmd_emotions"),
-            InlineKeyboardButton(text="🌠 Знаки", callback_data="cmd_signs")
-        )
-        builder.row(
-            InlineKeyboardButton(text="💎 Артефакты", callback_data="cmd_artifacts"),
-            InlineKeyboardButton(text="🌪 Пророчества", callback_data="cmd_prophecy"),
-            InlineKeyboardButton(text="🔮 Оракул", callback_data="cmd_oracle")
-        )
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🌀 Анализ", callback_data="cmd_analysis"),
+        InlineKeyboardButton(text="🌌 Эмоции", callback_data="cmd_emotions")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💎 Артефакты", callback_data="cmd_artifacts"),
+        InlineKeyboardButton(text="🌪 Пророчества", callback_data="cmd_prophecy")
+    )
 
-        await message.answer(
-            menu_text,
-            reply_markup=builder.as_markup(),
-            parse_mode=ParseMode.HTML
-        )
-        logger.info(f"Menu sent successfully to user {message.from_user.id}")
-    except Exception as e:
-        logger.error(f"Error in start command: {e}", exc_info=True)
-        await message.answer("Произошла ошибка при отображении меню")
+    await message.answer(menu_text, reply_markup=builder.as_markup())
 #
 # Добавляем обработчики для кнопок
 @router.callback_query(F.data.startswith("cmd_"))
@@ -241,6 +324,7 @@ async def cmd_analysis(message: Message, command: CommandObject):
     except Exception as e:
         logger.error(f"Error in analysis command: {e}", exc_info=True)
         await message.reply("Произошла ошибка при выполнении анализа")
+
 
 
 @router.message(Command("эмоции"))
@@ -491,4 +575,15 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+
+
+# Остальные обработчики остаются без изменений, но используют обновленный get_ai_response
+
+async def main():
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
     asyncio.run(main())
