@@ -292,10 +292,29 @@ async def handle_menu_buttons(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
+
 @router.message(Command("oracle"))
-async def cmd_oracle(message: Message):
-    """Обработка команды /oracle"""
-    await message.answer("🔮 Я здесь! Задайте свой вопрос вселенной:")
+async def cmd_oracle(message: Message, command: CommandObject):
+    """Обработка команды /oracle с аргументами"""
+    if not command.args:
+        await message.answer("🔮 Я здесь! Задайте свой вопрос после команды, например:\n/oracle как пройдет мой день?")
+        return
+
+    # Создаем и запускаем задачу с typing статусом
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(maintain_typing_status(message.chat.id, stop_typing))
+
+    try:
+        response = await get_ai_response(
+            message.from_user.id,
+            command.args,
+            message.chat.id
+        )
+        await message.reply(f"🔮 Ответ Оракула:\n\n{response}")
+    finally:
+        # Останавливаем typing статус
+        stop_typing.set()
+        await typing_task
 
 @router.message(Command("анализ"))
 async def cmd_analysis(message: Message, command: CommandObject):
@@ -547,21 +566,6 @@ async def handle_general_message(message: Message):
     if user_data.get('banned'):
         await message.answer("🚫 Ваш доступ к оракулу ограничен")
         return
-
-    try:
-        # Получаем ответ от ИИ
-        response = await get_ai_response(
-            user_id=message.from_user.id,
-            question=message.text,
-            chat_id=message.chat.id
-        )
-
-        # Отправляем ответ пользователю
-        await message.reply(f"🔮 Ответ Оракула:\n\n{response}")
-
-    except Exception as e:
-        logger.error(f"Error handling message: {e}", exc_info=True)
-        await message.answer("⚠️ Произошла ошибка при обработке запроса")
 
 @router.callback_query(F.data == "refresh_stats")
 async def refresh_stats(callback: CallbackQuery):
